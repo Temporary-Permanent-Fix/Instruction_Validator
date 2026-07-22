@@ -132,6 +132,26 @@ def _normalize_for_matching(value: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _resolve_column(df: pd.DataFrame, *candidates: str) -> str | None:
+    if df is None or df.empty:
+        return None
+    normalized = { _normalize_for_matching(column): column for column in df.columns }
+    for candidate in candidates:
+        resolved = normalized.get(_normalize_for_matching(candidate))
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _row_value(row: pd.Series, *candidates: str, default=None):
+    for candidate in candidates:
+        if candidate in row.index:
+            value = row[candidate]
+            if not pd.isna(value):
+                return value
+    return default
+
+
 def _http_get(url: str) -> str:
     request = Request(
         url,
@@ -258,10 +278,12 @@ def _score_packaging_signal(text: str) -> tuple[str, list[str]]:
 
 def _product_report_summary(result) -> pd.DataFrame:
     df = result.cases_enriched.copy()
-    if df.empty or "Kód produktu" not in df.columns:
+    code_col = _resolve_column(df, "Kód produktu")
+    name_col = _resolve_column(df, "Názov produktu", "Název produktu")
+    if df.empty or code_col is None:
         return pd.DataFrame(columns=["Kód produktu", "Názov produktu", "report_count", "case_count"])
 
-    group_cols = [column for column in ["Kód produktu", "Názov produktu"] if column in df.columns]
+    group_cols = [column for column in [code_col, name_col] if column is not None]
     summary = (
         df.groupby(group_cols, dropna=False)
         .agg(
@@ -271,6 +293,15 @@ def _product_report_summary(result) -> pd.DataFrame:
         .reset_index()
         .sort_values(by=["report_count", "case_count"], ascending=[False, False], kind="mergesort")
     )
+    rename_map = {}
+    if code_col != "Kód produktu":
+        rename_map[code_col] = "Kód produktu"
+    if name_col is not None and name_col != "Názov produktu":
+        rename_map[name_col] = "Názov produktu"
+    if rename_map:
+        summary = summary.rename(columns=rename_map)
+    if "Názov produktu" not in summary.columns:
+        summary["Názov produktu"] = pd.NA
     return summary.reset_index(drop=True)
 
 
@@ -536,8 +567,10 @@ def render_customer_online_review(result) -> None:
         st.info("No products available for review yet.")
         return
 
+    code_col = _resolve_column(summary, "Kód produktu")
+    name_col = _resolve_column(summary, "Názov produktu", "Název produktu")
     top_options = [
-        f"{row['Názov produktu']} [{row['Kód produktu']}] - reports: {int(row['report_count'])}, cases: {int(row['case_count'])}"
+        f"{_row_value(row, name_col, default='(bez názvu)')} [{_row_value(row, code_col, default='')}] - reports: {int(row['report_count'])}, cases: {int(row['case_count'])}"
         for _, row in summary.head(20).iterrows()
     ]
     selected_label = st.selectbox(
@@ -549,8 +582,8 @@ def render_customer_online_review(result) -> None:
     selected_index = top_options.index(selected_label)
     selected_summary = summary.iloc[selected_index]
 
-    selected_code = selected_summary.get("Kód produktu")
-    selected_name = selected_summary.get("Názov produktu")
+    selected_code = _row_value(selected_summary, code_col)
+    selected_name = _row_value(selected_summary, name_col)
     selected_code_text = None if pd.isna(selected_code) else str(selected_code)
     selected_name_text = "" if pd.isna(selected_name) else str(selected_name)
     analysis = fetch_alza_review_analysis(
