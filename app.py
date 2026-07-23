@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from datetime import datetime
 from io import BytesIO
 from html import unescape
 from urllib.parse import quote_plus, urljoin
@@ -83,6 +84,420 @@ def init_session_state() -> None:
     st.session_state.setdefault("review_status_widget", REVIEW_STATUS_OPTIONS[0])
     st.session_state.setdefault("final_action_widget", FINAL_ACTION_OPTIONS[0])
     st.session_state.setdefault("validator_note_widget", "")
+
+
+NEW_REVIEW_STATUS_OPTIONS = [
+    "Nový",
+    "V analýze",
+    "Čaká na zmenu v internom systéme",
+    "Zmena vykonaná",
+    "Zamietnuté",
+    "Nie je možné rozhodnúť",
+]
+
+LEGACY_REVIEW_STATUS_OPTIONS = [
+    "Neriešené",
+    "Rieši sa",
+    "Čaká na IT",
+    "Schválené",
+    "Hotovo",
+]
+
+REVIEW_STATUS_OPTIONS_V2 = NEW_REVIEW_STATUS_OPTIONS + [
+    status for status in LEGACY_REVIEW_STATUS_OPTIONS if status not in NEW_REVIEW_STATUS_OPTIONS
+]
+
+FINAL_ACTION_OPTIONS_V2 = [
+    "Iba štítok",
+    "Prelepiť páskou",
+    "Zabaliť do fólie",
+    "Použiť bublinkovú fóliu",
+    "Použiť obálku",
+    "Použiť kartónovú krabičku",
+    "Ponechať aktuálnu inštrukciu",
+    "Vyžaduje ďalšiu analýzu",
+    "Ponechať balenie",
+    "Odstrániť balenie",
+    "Upraviť parameter",
+    "Odovzdať na IT",
+    "Manuálna analýza",
+]
+
+EXTENDED_REVIEW_EXPORT_COLUMNS = [
+    "case_id",
+    "SKU",
+    "Product ID",
+    "Kód produktu",
+    "Názov produktu",
+    "original_instruction",
+    "final_instruction",
+    "status",
+    "review_status",
+    "final_action",
+    "review_saved_at",
+    "Validator note",
+    "validator_note",
+    "change_execution_status",
+    "change_executed_at",
+    "change_executed_by",
+    "instruction_category",
+    "report_count",
+    "recommended_action",
+    "suggested_parameter_to_check",
+    "confidence",
+    "decision_reason",
+    "validator_checklist",
+]
+
+INTERNAL_CONSOLE_URL_TEMPLATE = ""
+# TODO: Doplniť URL šablónu internej produktovej konzoly
+
+
+def safe_value(row: pd.Series | None, column_name: str, default="Neuvedené"):
+    if row is None or column_name not in row.index:
+        return default
+    value = row[column_name]
+    if pd.isna(value):
+        return default
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned if cleaned else default
+    return value
+
+
+def safe_text_value(row: pd.Series | None, column_name: str, default="Neuvedené") -> str:
+    value = safe_value(row, column_name, default=default)
+    if value == default:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _row_column_name(row: pd.Series, *candidates: str) -> str | None:
+    normalized = {_normalize_for_matching(str(column)): column for column in row.index}
+    for candidate in candidates:
+        resolved = normalized.get(_normalize_for_matching(candidate))
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _row_safe_value(row: pd.Series, *candidates: str, default="Neuvedené"):
+    column = _row_column_name(row, *candidates)
+    if column is None:
+        return default
+    return safe_value(row, column, default=default)
+
+
+def _current_timestamp() -> str:
+    return datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+def _current_user_identifier() -> str:
+    for key in ["current_user", "username", "user", "user_email", "email", "name"]:
+        value = st.session_state.get(key)
+        if value:
+            return str(value)
+    user_obj = getattr(st, "user", None)
+    for attr in ["email", "name", "username", "id"]:
+        value = getattr(user_obj, attr, None)
+        if value:
+            return str(value)
+    return ""
+
+
+def _normalize_review_entry(entry: dict | None, row: pd.Series | None = None) -> dict:
+    recommended_action = safe_text_value(row, "recommended_action", default="") if row is not None else ""
+    default_status = "Nový"
+    if recommended_action == "Odovzdať na IT":
+        default_status = "Čaká na zmenu v internom systéme"
+    elif recommended_action in {"Ponechať balenie", "Ponechať aktuálnu inštrukciu"}:
+        default_status = "V analýze"
+    elif recommended_action in {"Odstrániť balenie", "Prelepiť páskou", "Zabaliť do fólie"}:
+        default_status = "V analýze"
+
+    default_final_action = recommended_action if recommended_action in FINAL_ACTION_OPTIONS_V2 else "Vyžaduje ďalšiu analýzu"
+    normalized = {
+        "review_status": default_status,
+        "status": default_status,
+        "final_action": default_final_action,
+        "validator_note": "",
+        "review_saved_at": "",
+        "review_saved_by": "",
+        "change_execution_status": "",
+        "change_executed_at": "",
+        "change_executed_by": "",
+    }
+    if entry:
+        normalized.update(entry)
+    normalized.setdefault("status", normalized.get("review_status", default_status))
+    normalized.setdefault("review_status", normalized.get("status", default_status))
+    normalized.setdefault("final_action", default_final_action)
+    normalized.setdefault("validator_note", "")
+    normalized.setdefault("review_saved_at", "")
+    normalized.setdefault("review_saved_by", "")
+    normalized.setdefault("change_execution_status", "")
+    normalized.setdefault("change_executed_at", "")
+    normalized.setdefault("change_executed_by", "")
+    return normalized
+
+
+def ensure_optional_review_columns(df: pd.DataFrame) -> pd.DataFrame:
+    optional_columns = {
+        "SKU": "",
+        "Product ID": "",
+        "original_instruction": "",
+        "final_instruction": "",
+        "status": "",
+        "review_status": "",
+        "final_action": "",
+        "review_saved_at": "",
+        "review_saved_by": "",
+        "Validator note": "",
+        "validator_note": "",
+        "change_execution_status": "",
+        "change_executed_at": "",
+        "change_executed_by": "",
+    }
+    for column, default_value in optional_columns.items():
+        if column not in df.columns:
+            df[column] = default_value
+    return df
+
+
+def build_internal_console_url(product_id=None, sku=None):
+    template = INTERNAL_CONSOLE_URL_TEMPLATE.strip()
+    if not template:
+        return None
+    if product_id in [None, ""] and sku in [None, ""]:
+        return None
+    values = {}
+    if product_id not in [None, ""]:
+        values["product_id"] = quote_plus(str(product_id))
+    if sku not in [None, ""]:
+        values["sku"] = quote_plus(str(sku))
+    try:
+        class _BlankMapping(dict):
+            def __missing__(self, key):
+                return ""
+
+        return template.format_map(_BlankMapping(values))
+    except Exception:
+        return None
+
+
+def update_review_execution_fields(review_entry: dict, executed_by: str | None = None, executed_at: str | None = None) -> dict:
+    updated = dict(review_entry)
+    timestamp = executed_at or _current_timestamp()
+    updated["review_status"] = "Zmena vykonaná"
+    updated["status"] = "Zmena vykonaná"
+    updated["change_execution_status"] = "Zmena vykonaná"
+    updated["change_executed_at"] = timestamp
+    updated["change_executed_by"] = executed_by or ""
+    return updated
+
+
+def _is_valid_http_url(value: str) -> bool:
+    return bool(re.match(r"^https?://", value.strip(), flags=re.I))
+
+
+def _image_column_name(row: pd.Series) -> str | None:
+    preferred_tokens = ["image", "img", "photo", "foto", "fotka", "picture", "obraz"]
+    for column in row.index:
+        normalized = _normalize_for_matching(str(column))
+        if any(token in normalized for token in preferred_tokens):
+            return column
+    return None
+
+
+def _display_placeholder_image() -> None:
+    st.info("Fotografia produktu nie je k dispozícii.")
+
+
+def render_product_image(row: pd.Series) -> None:
+    image_column = _image_column_name(row)
+    if image_column is None:
+        # TODO: Napojenie na finálny zdroj produktových fotografií
+        _display_placeholder_image()
+        return
+
+    image_url = safe_text_value(row, image_column, default="")
+    if not image_url or not _is_valid_http_url(image_url):
+        _display_placeholder_image()
+        return
+
+    try:
+        request = Request(
+            image_url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "image/*,*/*;q=0.8",
+            },
+        )
+        with urlopen(request, timeout=10) as response:
+            content = response.read()
+        st.image(BytesIO(content), caption="Fotografia produktu", use_container_width=True)
+    except Exception:
+        _display_placeholder_image()
+
+
+def render_product_header(case_row: pd.Series) -> None:
+    st.markdown("### Produkt")
+    left, right = st.columns([1, 2])
+    with left:
+        render_product_image(case_row)
+    with right:
+        product_name = _row_safe_value(case_row, "Názov produktu", "Název produktu")
+        sku = _row_safe_value(case_row, "Kód produktu")
+        product_id = _row_safe_value(case_row, "Product ID", "SEOPrefix_ID", "ID produktu")
+        category = _row_safe_value(case_row, "Segment1", "Kategória", "Kategorie")
+        current_instruction = _row_safe_value(
+            case_row,
+            "Přeložené instrukce",
+            "Peložené instrukce",
+            "Přeložená instrukce",
+        )
+        details = pd.DataFrame(
+            [
+                {
+                    "Názov produktu": product_name,
+                    "SKU": sku,
+                    "Product ID": product_id,
+                    "Kategória produktu": category,
+                    "Aktuálna baliaca inštrukcia": current_instruction,
+                }
+            ]
+        )
+        st.dataframe(details, use_container_width=True, hide_index=True)
+
+        console_url = build_internal_console_url(
+            product_id=None if product_id == "Neuvedené" else product_id,
+            sku=None if sku == "Neuvedené" else sku,
+        )
+        if console_url:
+            if hasattr(st, "link_button"):
+                st.link_button("Otvoriť produkt v konzole", console_url)
+            else:
+                st.markdown(f"[Otvoriť produkt v konzole]({console_url})")
+        else:
+            st.button("Otvoriť produkt v konzole", disabled=True)
+            st.caption("Konzola zatiaľ nie je nakonfigurovaná.")
+
+
+def render_case_reason(case_row: pd.Series) -> None:
+    st.markdown("### Dôvod kontroly")
+    reason_rows = [
+        ("Počet hlásení", _row_safe_value(case_row, "report_count")),
+        ("Počet používateľov", _row_safe_value(case_row, "unique_users_count")),
+        ("Prvé hlásenie", _row_safe_value(case_row, "first_reported_at")),
+        ("Posledné hlásenie", _row_safe_value(case_row, "last_reported_at")),
+        ("Hlavný dôvod kontroly", _row_safe_value(case_row, "main_trigger_parameter")),
+        ("Identifikované rizikové vlastnosti", _row_safe_value(case_row, "active_risk_parameters")),
+        ("Vyhodnotenie rizika", _row_safe_value(case_row, "risk_evaluation")),
+        ("AI odporúčanie", _row_safe_value(case_row, "ai_decision_hint")),
+        ("Odporúčané opatrenie", _row_safe_value(case_row, "recommended_action")),
+        ("Zdôvodnenie rozhodnutia", _row_safe_value(case_row, "decision_reason")),
+    ]
+    st.dataframe(pd.DataFrame(reason_rows, columns=["Pole", "Hodnota"]), use_container_width=True, hide_index=True)
+
+
+def render_instruction_comparison(case_row: pd.Series) -> None:
+    st.markdown("### Porovnanie inštrukcií")
+    current_instruction = _row_safe_value(case_row, "Přeložené instrukce", "Peložené instrukce", "Přeložená instrukce")
+    recommended_instruction = _row_safe_value(case_row, "recommended_action")
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Aktuálna inštrukcia**")
+        st.write(current_instruction)
+    with right:
+        st.markdown("**Odporúčaná inštrukcia**")
+        st.write(recommended_instruction)
+
+
+def _review_widget_key(case_id: str, field: str) -> str:
+    return f"{field}_{case_id}"
+
+
+def _selectbox_options_with_current(current_value: str, base_options: list[str]) -> list[str]:
+    if current_value in base_options:
+        return base_options
+    return [current_value] + base_options
+
+
+def render_review_form(case_id: str, case_row: pd.Series) -> None:
+    st.markdown("### Review detail")
+    review_state = _normalize_review_entry(st.session_state.review_data.get(case_id), case_row)
+    st.session_state.review_data[case_id] = review_state
+
+    status_key = _review_widget_key(case_id, "status")
+    final_action_key = _review_widget_key(case_id, "final_action")
+    validator_note_key = _review_widget_key(case_id, "validator_note")
+    status_options = _selectbox_options_with_current(review_state["review_status"], REVIEW_STATUS_OPTIONS_V2)
+    final_action_options = _selectbox_options_with_current(review_state["final_action"], FINAL_ACTION_OPTIONS_V2)
+
+    st.session_state.setdefault(status_key, review_state["review_status"])
+    st.session_state.setdefault(final_action_key, review_state["final_action"])
+    st.session_state.setdefault(validator_note_key, review_state["validator_note"])
+
+    st.selectbox("Status", options=status_options, key=status_key)
+    st.selectbox("Final action", options=final_action_options, key=final_action_key)
+    st.text_area("Validator note", key=validator_note_key, height=180)
+
+    cols = st.columns([1, 1])
+    with cols[0]:
+        if st.button("Save review", key=f"save_review_{case_id}"):
+            save_current_review(case_id, case_row, explicit_save=True)
+            st.success("Rozhodnutie bolo uložené.")
+    with cols[1]:
+        change_state = st.session_state.review_data.get(case_id, {})
+        can_confirm = bool(change_state.get("review_saved_at"))
+        already_executed = change_state.get("change_execution_status") == "Zmena vykonaná"
+        confirm_key = _review_widget_key(case_id, "confirm_change")
+        if already_executed:
+            st.info("Zmena už bola označená ako vykonaná.")
+        elif can_confirm:
+            if st.button("Potvrdiť vykonanie zmeny", key=f"confirm_change_{case_id}"):
+                st.session_state[confirm_key] = True
+            if st.session_state.get(confirm_key):
+                st.warning("Toto označí prípad ako vybavený. Pokračovať?")
+                confirm_cols = st.columns(2)
+                with confirm_cols[0]:
+                    if st.button("Áno, potvrdiť", key=f"confirm_change_yes_{case_id}"):
+                        mark_change_as_executed(case_id)
+                        st.session_state[confirm_key] = False
+                        st.success("Zmena bola označená ako vykonaná.")
+                with confirm_cols[1]:
+                    if st.button("Zrušiť", key=f"confirm_change_no_{case_id}"):
+                        st.session_state[confirm_key] = False
+        else:
+            st.button("Potvrdiť vykonanie zmeny", disabled=True, key=f"confirm_change_disabled_{case_id}")
+            st.caption("Najprv uložte review, až potom je možné potvrdiť vykonanie zmeny.")
+
+    save_current_review(case_id, case_row, explicit_save=False)
+
+
+def save_current_review(case_id: str, case_row: pd.Series, explicit_save: bool = False) -> None:
+    review_entry = _normalize_review_entry(st.session_state.review_data.get(case_id), case_row)
+    status_key = _review_widget_key(case_id, "status")
+    final_action_key = _review_widget_key(case_id, "final_action")
+    validator_note_key = _review_widget_key(case_id, "validator_note")
+    review_entry["review_status"] = st.session_state.get(status_key, review_entry["review_status"])
+    review_entry["status"] = review_entry["review_status"]
+    review_entry["final_action"] = st.session_state.get(final_action_key, review_entry["final_action"])
+    review_entry["validator_note"] = str(st.session_state.get(validator_note_key, review_entry["validator_note"]) or "").strip()
+    if explicit_save:
+        review_entry["review_saved_at"] = _current_timestamp()
+        review_entry["review_saved_by"] = _current_user_identifier()
+    st.session_state.review_data[case_id] = review_entry
+
+
+def mark_change_as_executed(case_id: str) -> None:
+    if case_id not in st.session_state.review_data:
+        return
+    review_entry = _normalize_review_entry(st.session_state.review_data.get(case_id))
+    updated = update_review_execution_fields(review_entry, executed_by=_current_user_identifier())
+    st.session_state.review_data[case_id] = updated
+    st.session_state[_review_widget_key(case_id, "status")] = updated["review_status"]
 
 
 ALZA_BASE_URL = "https://www.alza.sk"
@@ -792,6 +1207,185 @@ def render_decision_review(result) -> None:
             st.success("Review saved for this case.")
         else:
             save_current_review(selected_case_id)
+
+
+def ensure_review_defaults(case_id: str, row: pd.Series) -> dict[str, str]:
+    review_data = st.session_state.review_data
+    review_data[case_id] = _normalize_review_entry(review_data.get(case_id), row)
+    return review_data[case_id]
+
+
+def save_current_review(case_id: str, case_row: pd.Series, explicit_save: bool = False) -> None:
+    review_entry = _normalize_review_entry(st.session_state.review_data.get(case_id), case_row)
+    status_key = _review_widget_key(case_id, "status")
+    final_action_key = _review_widget_key(case_id, "final_action")
+    validator_note_key = _review_widget_key(case_id, "validator_note")
+
+    review_entry["review_status"] = st.session_state.get(status_key, review_entry["review_status"])
+    review_entry["status"] = review_entry["review_status"]
+    review_entry["final_action"] = st.session_state.get(final_action_key, review_entry["final_action"])
+    review_entry["validator_note"] = str(st.session_state.get(validator_note_key, review_entry["validator_note"]) or "").strip()
+    if explicit_save:
+        review_entry["review_saved_at"] = _current_timestamp()
+        review_entry["review_saved_by"] = _current_user_identifier()
+    st.session_state.review_data[case_id] = review_entry
+
+
+def mark_change_as_executed(case_id: str) -> None:
+    if case_id not in st.session_state.review_data:
+        return
+    review_entry = _normalize_review_entry(st.session_state.review_data.get(case_id))
+    updated = update_review_execution_fields(review_entry, executed_by=_current_user_identifier())
+    st.session_state.review_data[case_id] = updated
+    st.session_state[_review_widget_key(case_id, "status")] = updated["review_status"]
+
+
+def build_reviewed_cases(result) -> pd.DataFrame:
+    rows = []
+    for _, row in result.cases_enriched.iterrows():
+        case_id = str(row.get("case_id"))
+        review_values = ensure_review_defaults(case_id, row)
+        original_instruction = _row_safe_value(row, "Přeložené instrukce", "Peložené instrukce", "Přeložená instrukce")
+        product_id = _row_safe_value(row, "Product ID", "SEOPrefix_ID", "ID produktu", default="")
+        if product_id in {"", "Neuvedené"}:
+            product_id = ""
+        rows.append(
+            {
+                "case_id": row.get("case_id"),
+                "SKU": _row_safe_value(row, "Kód produktu"),
+                "Product ID": product_id,
+                "Kód produktu": _row_safe_value(row, "Kód produktu"),
+                "Názov produktu": _row_safe_value(row, "Názov produktu", "Název produktu"),
+                "original_instruction": original_instruction,
+                "final_instruction": review_values["final_action"],
+                "status": review_values["review_status"],
+                "review_status": review_values["review_status"],
+                "final_action": review_values["final_action"],
+                "review_saved_at": review_values["review_saved_at"],
+                "Validator note": review_values["validator_note"],
+                "validator_note": review_values["validator_note"],
+                "change_execution_status": review_values["change_execution_status"],
+                "change_executed_at": review_values["change_executed_at"],
+                "change_executed_by": review_values["change_executed_by"],
+                "instruction_category": row.get("instruction_category"),
+                "report_count": row.get("report_count"),
+                "recommended_action": row.get("recommended_action"),
+                "suggested_parameter_to_check": row.get("suggested_parameter_to_check"),
+                "confidence": row.get("confidence"),
+                "decision_reason": row.get("decision_reason"),
+                "validator_checklist": row.get("validator_checklist"),
+            }
+        )
+    reviewed_cases = pd.DataFrame(rows)
+    reviewed_cases = ensure_optional_review_columns(reviewed_cases)
+    ordered_columns = [column for column in EXTENDED_REVIEW_EXPORT_COLUMNS if column in reviewed_cases.columns]
+    trailing_columns = [column for column in reviewed_cases.columns if column not in ordered_columns]
+    return reviewed_cases.loc[:, ordered_columns + trailing_columns]
+
+
+def reviewed_cases_bytes(reviewed_cases: pd.DataFrame) -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        reviewed_cases.to_excel(writer, sheet_name="reviewed_cases", index=False)
+    return buffer.getvalue()
+
+
+def render_case_detail(case_id: str, case_row: pd.Series) -> None:
+    st.subheader("Case detail")
+    render_product_header(case_row)
+    st.divider()
+    render_case_reason(case_row)
+    st.divider()
+    render_instruction_comparison(case_row)
+    st.divider()
+    render_review_form(case_id, case_row)
+
+
+def render_decision_review(result) -> None:
+    review_df = result.cases_enriched.copy()
+
+    def _options_for(column: str) -> list[str]:
+        if column not in review_df.columns:
+            return []
+        return sorted(review_df[column].dropna().astype(str).unique().tolist())
+
+    filter_row_1 = st.columns(4)
+    with filter_row_1[0]:
+        recommended_action_filter = st.multiselect(
+            "Recommended action",
+            options=_options_for("recommended_action"),
+            default=_options_for("recommended_action"),
+        )
+    with filter_row_1[1]:
+        instruction_category_filter = st.multiselect(
+            "Instruction category",
+            options=_options_for("instruction_category"),
+            default=_options_for("instruction_category"),
+        )
+    with filter_row_1[2]:
+        priority_filter = st.multiselect(
+            "Priority",
+            options=_options_for("priority"),
+            default=_options_for("priority"),
+        )
+    with filter_row_1[3]:
+        confidence_filter = st.multiselect(
+            "Confidence",
+            options=_options_for("confidence"),
+            default=_options_for("confidence"),
+        )
+
+    filter_row_2 = st.columns(4)
+    with filter_row_2[0]:
+        product_match_status_filter = st.multiselect(
+            "Product match status",
+            options=_options_for("product_match_status"),
+            default=_options_for("product_match_status"),
+        )
+    with filter_row_2[1]:
+        trigger_detected_filter = st.multiselect(
+            "Trigger detected",
+            options=_options_for("trigger_detected"),
+            default=_options_for("trigger_detected"),
+        )
+    with filter_row_2[2]:
+        has_risk_flag_filter = st.multiselect(
+            "Has risk flag",
+            options=_options_for("has_risk_flag"),
+            default=_options_for("has_risk_flag"),
+        )
+    with filter_row_2[3]:
+        minimum_report_count = st.number_input("Minimum report_count", min_value=0, value=0, step=1)
+
+    filtered = review_df.copy()
+    for column, values in [
+        ("recommended_action", recommended_action_filter),
+        ("instruction_category", instruction_category_filter),
+        ("priority", priority_filter),
+        ("confidence", confidence_filter),
+        ("product_match_status", product_match_status_filter),
+        ("trigger_detected", trigger_detected_filter),
+        ("has_risk_flag", has_risk_flag_filter),
+    ]:
+        if values and column in filtered.columns:
+            filtered = filtered[filtered[column].astype(str).isin(values)]
+
+    if minimum_report_count and "report_count" in filtered.columns:
+        filtered = filtered[filtered["report_count"] >= minimum_report_count]
+
+    display_columns = [column for column in DISPLAY_CASE_COLUMNS if column in filtered.columns]
+    st.subheader("Case list")
+    st.dataframe(filtered.loc[:, display_columns], use_container_width=True, hide_index=True)
+
+    case_options = filtered["case_id"].dropna().astype(str).tolist() if "case_id" in filtered.columns else []
+    if not case_options:
+        st.info("No cases match the current filters.")
+        return
+
+    selected_case_id = st.selectbox("Select case_id", options=case_options, index=0)
+    selected_row = review_df.loc[review_df["case_id"].astype(str) == selected_case_id].iloc[0]
+    ensure_review_defaults(selected_case_id, selected_row)
+    render_case_detail(selected_case_id, selected_row)
 
 
 def render_upload_processing(result) -> None:

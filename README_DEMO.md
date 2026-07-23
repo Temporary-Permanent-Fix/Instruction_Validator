@@ -1,18 +1,18 @@
-# Packaging Instruction Enrichment & Decision Maker Demo
+﻿# Packaging Instruction Enrichment & Decision Maker Demo
 
-This app helps the team turn the manual packaging-instruction review process into a repeatable Excel-driven workflow.
+This app turns the manual packaging-instruction review workflow into a clearer Streamlit decision review tool.
 
-## What it does
+## What the app does
 
-- Loads the uploaded `Chybné instrukce` workbook.
+- Loads the uploaded `Chybné instrukcie` workbook.
 - Loads the uploaded `Produkty a vlastnosti` workbook.
 - Builds cleaned report and product tables.
-- Creates case-level enrichment and decision-maker outputs.
-- Exports a single readable Excel workbook for internal review and downstream use.
+- Produces case-level enrichment and the rule-based decision output.
+- Exports the processed workbook for internal use.
 
 ## Required input files
 
-- `Chybné instrukce` Excel file
+- `Chybné instrukcie` Excel file
 - `Produkty a vlastnosti` Excel file
 
 Optional:
@@ -21,26 +21,30 @@ Optional:
 
 ## How to run
 
-1. Open `start_enrichment_maker.bat`
-2. Wait for Streamlit to start
-3. Upload the two required Excel files
-4. Review the results and download the processed workbook
+1. Double-click `Start_enrichment_maker.bat`
+2. Wait for Streamlit to open
+3. Upload the required Excel files
+4. Click `Process files`
+5. Review the dashboard and decision cards
 
 ## Exported sheets
 
-The workbook exports these sheets in order:
+The processed workbook keeps these sheets:
 
 1. `summary`
 2. `decision_summary`
 3. `ai_cases_input`
 4. `cases_enriched`
 5. `cases_mvp`
-6. `invalid_reports`
-7. `reports_clean`
-8. `products_clean`
+6. `reports_clean`
+7. `products_clean`
 
-## What `ai_cases_input` is for
+## What `ai_cases_input` is used for
 
-`ai_cases_input` is the filtered, ranked case table prepared for AI Studio or other manual-review workflows.
+`ai_cases_input` is the filtered case table prepared for downstream AI Studio or manual review workflows.
 
-It keeps the case-level data plus the decision columns, so reviewers can focus on the highest-priority cases without rebuilding the logic manually.
+It contains the cases that match the selected filters and is meant to be the compact handoff table for reviewers.
+
+## Review export
+
+If reviewers save edits in the Decision Review tab, the app also offers a `reviewed_cases.xlsx` export with the review outcome fields.
